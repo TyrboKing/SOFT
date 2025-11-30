@@ -1,10 +1,11 @@
  (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/bot.py b/bot.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b23094e4c
+index 0000000000000000000000000000000000000000..2f08de0d7cfb671655917e458bc8120aeeb12bb6
 --- /dev/null
 +++ b/bot.py
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,362 @@
++import argparse
 +import json
 +import logging
 +import os
@@ -78,10 +79,11 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +                "stop_loss": None,
 +                "updated_by": None,
 +                "last_action": "initial",
++                "chat_ids": [],
 +            }
 +        try:
 +            with self._path.open("r", encoding="utf-8") as file:
-+                return json.load(file)
++                state = json.load(file)
 +        except json.JSONDecodeError:
 +            logging.warning("State file %s was invalid JSON. Resetting state.", self._path)
 +            return {
@@ -89,7 +91,12 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +                "stop_loss": None,
 +                "updated_by": None,
 +                "last_action": "reset",
++                "chat_ids": [],
 +            }
++
++        # Ensure new keys exist even for legacy files
++        state.setdefault("chat_ids", [])
++        return state
 +
 +    def _save(self) -> None:
 +        with self._path.open("w", encoding="utf-8") as file:
@@ -127,6 +134,15 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +        )
 +        self._save()
 +        return self._state
++
++    def register_chat(self, chat_id: int) -> None:
++        chat_ids = self._state.setdefault("chat_ids", [])
++        if chat_id not in chat_ids:
++            chat_ids.append(chat_id)
++            self._save()
++
++    def chat_ids(self) -> List[int]:
++        return list(self._state.get("chat_ids", []))
 +
 +    def data(self) -> dict:
 +        return self._state
@@ -199,8 +215,12 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +
 +async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 +    user_id = update.effective_user.id if update.effective_user else None
++    chat_id = update.effective_chat.id if update.effective_chat else None
 +    store: StateStore = context.application.bot_data["store"]
 +    config: BotConfig = context.application.bot_data["config"]
++
++    if chat_id is not None:
++        store.register_chat(chat_id)
 +    await update.message.reply_text(
 +        render_state_message(
 +            store.data(), is_admin(user_id, config.admin_ids), is_master(user_id, config.master_id)
@@ -217,8 +237,12 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +    await query.answer()
 +    action = query.data
 +    user_id = query.from_user.id if query.from_user else 0
++    chat_id = query.message.chat_id if query.message else None
 +    store: StateStore = context.application.bot_data["store"]
 +    config: BotConfig = context.application.bot_data["config"]
++
++    if chat_id is not None:
++        store.register_chat(chat_id)
 +
 +    master = is_master(user_id, config.master_id)
 +    if action in {"open_long", "open_short", "close"} and not master:
@@ -226,10 +250,13 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +        state = store.data()
 +    elif action == "open_long":
 +        state = store.open_position("long", user_id)
++        await notify_all_chats(state, context, exclude_chat_id=query.message.chat_id if query.message else None)
 +    elif action == "open_short":
 +        state = store.open_position("short", user_id)
++        await notify_all_chats(state, context, exclude_chat_id=query.message.chat_id if query.message else None)
 +    elif action == "close":
 +        state = store.close_position(user_id)
++        await notify_all_chats(state, context, exclude_chat_id=query.message.chat_id if query.message else None)
 +    else:
 +        state = store.data()
 +
@@ -243,6 +270,7 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +
 +async def handle_stop_loss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 +    user_id = update.effective_user.id if update.effective_user else None
++    chat_id = update.effective_chat.id if update.effective_chat else None
 +    config: BotConfig = context.application.bot_data["config"]
 +    if not is_master(user_id, config.master_id):
 +        await update.message.reply_text("Только главный аккаунт может менять стоп-лосс.")
@@ -257,12 +285,15 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +
 +    value_arg = args[0]
 +    store: StateStore = context.application.bot_data["store"]
++    if chat_id is not None:
++        store.register_chat(chat_id)
 +
 +    if value_arg.lower() in {"clear", "none", "reset"}:
 +        state = store.update_stop_loss(None, user_id)
 +        await update.message.reply_text(
 +            render_state_message(state, is_admin(user_id, config.admin_ids), True)
 +        )
++        await notify_all_chats(state, context, exclude_chat_id=chat_id)
 +        return
 +
 +    try:
@@ -275,9 +306,38 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +    await update.message.reply_text(
 +        render_state_message(state, is_admin(user_id, config.admin_ids), True)
 +    )
++    await notify_all_chats(state, context, exclude_chat_id=chat_id)
++
++
++async def notify_all_chats(state: dict, context: ContextTypes.DEFAULT_TYPE, exclude_chat_id: Optional[int] = None) -> None:
++    store: StateStore = context.application.bot_data["store"]
++    config: BotConfig = context.application.bot_data["config"]
++    for chat_id in store.chat_ids():
++        if exclude_chat_id is not None and chat_id == exclude_chat_id:
++            continue
++        await context.bot.send_message(
++            chat_id=chat_id,
++            text=render_state_message(
++                state,
++                is_admin(chat_id, config.admin_ids),
++                is_master(chat_id, config.master_id),
++            ),
++            reply_markup=build_keyboard(is_master(chat_id, config.master_id)),
++        )
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Trading signal relay bot")
++    parser.add_argument(
++        "--check",
++        action="store_true",
++        help="Validate configuration and exit without starting polling",
++    )
++    return parser.parse_args()
 +
 +
 +def main() -> None:
++    args = parse_args()
 +    logging.basicConfig(level=logging.INFO)
 +
 +    config = BotConfig.from_env()
@@ -296,6 +356,10 @@ index 0000000000000000000000000000000000000000..800c071c17e23017168ecc3700f4cf6b
 +        logging.warning(
 +            "BOT_MASTER_ID не задан. Команды трейдинга будут доступны любому пользователю."
 +        )
++
++    if args.check:
++        logging.info("Configuration validated. Exiting due to --check flag.")
++        return
 +
 +    logging.info("Bot is starting with state file at %s", config.state_path)
 +    application.run_polling(allowed_updates=["message", "callback_query"])
